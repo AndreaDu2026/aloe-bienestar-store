@@ -1,17 +1,18 @@
 import { NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
 import { products } from '@/lib/products';
+
+const paymentBaseUrl = process.env.KUSHKI_API_URL || 'https://api.kushkipagos.com';
 
 export async function POST(request: Request) {
   try {
     const body = await request.json();
     const customer = body?.customer;
     const items = body?.items;
-    if (!customer?.name || !customer?.email || !customer?.phone || !customer?.province || !customer?.city || !customer?.address || !Array.isArray(items) || items.length === 0) {
-      return NextResponse.json({ error: 'Completa los datos obligatorios del checkout.' }, { status: 400 });
-    }
-    if (items.length > 50) return NextResponse.json({ error: 'Demasiados productos en el pedido.' }, { status: 400 });
+    if (!customer?.name || !customer?.email || !customer?.phone || !customer?.province || !customer?.city || !customer?.address || !Array.isArray(items) || items.length === 0) return NextResponse.json({ error: 'Completa los datos obligatorios del checkout.' }, { status: 400 });
+    if (!process.env.DATABASE_URL) return NextResponse.json({ error: 'La tienda necesita configurar PostgreSQL antes de recibir pedidos reales.' }, { status: 503 });
+    if (!process.env.KUSHKI_PRIVATE_MERCHANT_ID) return NextResponse.json({ error: 'Falta configurar la credencial privada de Kushki.' }, { status: 503 });
 
-    // El servidor reconstruye el importe desde el catálogo, nunca desde el navegador.
     const lines = items.map((item: { id: string; quantity: number }) => {
       const product = products.find((p) => p.id === item.id);
       const quantity = Number(item.quantity);
@@ -22,20 +23,36 @@ export async function POST(request: Request) {
     const shipping = subtotal >= 50 ? 0 : 4.5;
     const total = subtotal + shipping;
 
-    // Punto único para integrar el gateway real. No se aceptan ni almacenan datos de tarjeta aquí.
-    if (!process.env.PAYMENT_PROVIDER || !process.env.PAYMENT_CREATE_URL) {
-      return NextResponse.json({ error: `El checkout está listo, pero falta configurar el proveedor de pagos para Ecuador. Total validado: $${total.toFixed(2)}.` }, { status: 503 });
-    }
-
-    const paymentResponse = await fetch(process.env.PAYMENT_CREATE_URL, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.PAYMENT_API_KEY || ''}` },
-      body: JSON.stringify({ amount: total, currency: 'USD', customer, items: lines.map(({ product, quantity }) => ({ id: product.id, name: product.name, quantity, unitPrice: product.price })), idempotencyKey: crypto.randomUUID() }),
+    const customerRecord = await prisma.customer.upsert({
+      where: { id: customer.id || 'never-existing-id' },
+      update: { name: customer.name, email: customer.email, phone: customer.phone, taxId: customer.taxId || null, province: customer.province, city: customer.city, address: customer.address, reference: customer.reference || null, postalCode: customer.postalCode || null },
+      create: { name: customer.name, email: customer.email, phone: customer.phone, taxId: customer.taxId || null, province: customer.province, city: customer.city, address: customer.address, reference: customer.reference || null, postalCode: customer.postalCode || null },
     });
-    if (!paymentResponse.ok) return NextResponse.json({ error: 'El proveedor de pagos no pudo iniciar la transacción.' }, { status: 502 });
-    const payment = await paymentResponse.json();
-    if (!payment.redirectUrl) return NextResponse.json({ error: 'Respuesta de pago incompleta.' }, { status: 502 });
-    return NextResponse.json({ redirectUrl: payment.redirectUrl });
+
+    const order = await prisma.order.create({ data: { customerId: customerRecord.id, subtotal, shipping, total, items: { create: lines.map(({ product, quantity }) => ({ productId: product.id, productName: product.name, quantity, unitPrice: product.price })) }, payment: { create: { provider: 'kushki', amount: total, currency: 'USD' } } }, include: { items: true } });
+
+    const publicUrl = process.env.NEXT_PUBLIC_SITE_URL;
+    if (!publicUrl) return NextResponse.json({ error: 'Falta configurar NEXT_PUBLIC_SITE_URL.' }, { status: 503 });
+
+    const response = await fetch(`${paymentBaseUrl}/smartlink/v1/webcheckout`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Private-Merchant-Id': process.env.KUSHKI_PRIVATE_MERCHANT_ID },
+      body: JSON.stringify({
+        kind: 'webcheckout',
+        redirectURL: `${publicUrl}/pedido/${order.id}`,
+        contactDetail: { email: customer.email, name: customer.name },
+        products: lines.map(({ product, quantity }) => ({ name: product.name, description: product.shortDescription, quantity, unitPrice: product.price })),
+        paymentConfig: { amount: { subtotalIva: 0, subtotalIva0: total, iva: 0, currency: 'USD' }, paymentMethod: ['credit-card'] },
+        additionalInformation: { orderId: order.id },
+      }),
+    });
+    if (!response.ok) { await prisma.order.update({ where: { id: order.id }, data: { status: 'CANCELLED' } }); return NextResponse.json({ error: 'Kushki no pudo iniciar el checkout.' }, { status: 502 }); }
+    const payment = await response.json();
+    if (!payment.webcheckoutUrl) return NextResponse.json({ error: 'Respuesta incompleta del proveedor de pagos.' }, { status: 502 });
+    if (payment.webcheckoutId) await prisma.payment.update({ where: { orderId: order.id }, data: { externalId: payment.webcheckoutId } });
+    return NextResponse.json({ redirectUrl: payment.webcheckoutUrl });
   } catch (error) {
+    console.error('checkout_error', error);
     return NextResponse.json({ error: error instanceof Error ? error.message : 'No fue posible procesar el pedido.' }, { status: 400 });
   }
 }
