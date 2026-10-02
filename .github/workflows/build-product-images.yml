@@ -12,7 +12,6 @@ permissions:
 
 jobs:
   build:
-    if: ${{ hashFiles('scripts/product-images.json') != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
