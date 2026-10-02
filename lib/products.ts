@@ -5,7 +5,10 @@ export type Product = {
 };
 
 function slugify(value: string) { return value.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, ''); }
-function imageForSku(sku: string) { return sku ? `https://gallery.foreverliving.com/gallery/ESP/download/products/${sku}.pdf` : ''; }
+function imageForSku(sku: string) {
+  if (sku === '215') return '';
+  return sku ? '/products/' + sku + '.webp' : '/products/tri-pack-aloe-vera-gel.webp';
+}
 
 export const products: Product[] = (catalog as CatalogRow[]).map(([sku,name,category,presentation,price,description,badge]) => {
   const id = slugify(name);
